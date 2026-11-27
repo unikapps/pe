@@ -1,0 +1,66 @@
+version: 2
+
+# Dependabot alerts and security-update PRs are switched on in the repository
+# settings (Security > Dependabot); this file only shapes version-update PRs.
+# A 7-day cooldown means a release is a week old before we're offered it, so a
+# compromised publish has time to be caught and pulled.
+
+updates:
+  # The SHA-pinned actions in .github/workflows (each pin keeps its "# vN" note).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  # Base images in the Dockerfile (PHP, Node, nginx, Composer). The tags float
+  # on patch releases, so this only proposes new minor/major versions.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      images:
+        patterns: ["*"]
+    commit-message:
+      prefix: "docker"
+
+  # Composer and npm: no routine version bumps (open-pull-requests-limit 0);
+  # security updates still arrive, grouped into one PR each.
+  - package-ecosystem: composer
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    versioning-strategy: increase-if-necessary
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+    versioning-strategy: increase-if-necessary
+    cooldown:
+      default-days: 7
+    groups:
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+    commit-message:
+      prefix: "deps"

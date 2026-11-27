@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
+
+# No token permissions unless a job asks for them.
+permissions: {}
+
+# A new push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Actions are pinned to commit SHAs (a moved tag can't change what runs);
+# Dependabot proposes the bumps (.github/dependabot.yml).
+#
+# Two jobs on purpose: every cheap check (audits, secret scan, lint, types,
+# tests, migrations) shares `verify`. `docker` builds the production images,
+# boots the whole stack and scans the images, so it only runs once `verify`
+# passes.
+
+env:
+  # Same versions as the Dockerfile.
+  PHP_VERSION: "8.6"
+  NODE_VERSION: "26"
+
+jobs:
+  verify:
+    name: verify (audits · lint · types · tests · migrations)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # gitleaks lists a pull request's commits through the API.
+      pull-requests: read
+    services:
+      pgsql:
+        # Same image as compose.yaml and docker-compose.coolify.yml.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_DB: genstudio
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: secret
+        # .env.example points at 5433, like the local compose stack.
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d genstudio"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: gitleaks scans the commits this push or PR adds.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # --- Fast, install-free checks first ---------------------------------
+
+      # The workflows themselves: injection, over-broad permissions, unpinned or
+      # credential-persisting actions.
+      - name: Workflow audit (zizmor)
+        run: pipx run zizmor==1.31.1 --offline --min-severity medium .github/workflows
+
+      # Committed secrets. Test-only values are allowlisted in .gitleaks.toml.
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_VERSION: "8.30.1"
+
+      # --- Dependencies ----------------------------------------------------
+
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: pdo_pgsql, pcntl, bcmath, intl, mbstring, zip
+          tools: composer:v2
+          coverage: none
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # Fails if composer.lock no longer matches composer.json.
+      - name: Composer manifest and lockfile
+        run: composer validate --strict
+
+      # Known vulnerabilities in what we ship fail the build; dev-only ones
+      # warn. The dev audits run first so a production failure can't hide them.
+      - name: Dependency audit (dev, warn only)
+        run: |
+          composer audit --locked || echo "::warning title=Composer audit::Vulnerable or abandoned dev packages. See this step's log."
+          npm audit || echo "::warning title=npm audit::Vulnerable dev packages. See this step's log."
+
+      - name: Dependency audit (production)
+        run: |
+          composer audit --locked --no-dev --abandoned=report
+          npm audit --omit=dev --audit-level=moderate
+
+      - name: Install
+        run: |
+          composer install --no-interaction --prefer-dist --no-progress
+          npm ci
+
+      # --- Code ------------------------------------------------------------
+
+      - name: Prepare .env
+        run: |
+          cp .env.example .env
+          php artisan key:generate --ansi
+
+      - name: Lint + format (Pint)
+        run: composer lint:check
+
+      - name: Static analysis (Larastan)
+        run: composer types:check
+
+      # Also generates Wayfinder's typed routes, which the type check reads,
+      # and the Vite manifest the feature tests render pages with.
+      - name: Build assets
+        run: npm run build
+
+      - name: Lint + format (frontend)
+        run: npm run check
+
+      - name: Typecheck (vue-tsc)
+        run: npm run types:check
+
+      # --- Database, against the production Postgres image -----------------
+
+      - name: Create the testing database
+        run: psql -h 127.0.0.1 -p 5433 -U app -d genstudio -c 'CREATE DATABASE genstudio_testing;'
+        env:
+          PGPASSWORD: secret
+
+      - name: Tests (Pest)
+        run: php artisan test --compact
+
+      - name: Migrate a clean database, roll everything back, migrate again
+        run: |
+          php artisan migrate --force
+          php artisan migrate:reset --force
+          php artisan migrate --force
+
+  # The production images, as Coolify builds them: build, boot the full stack,
+  # smoke-test it and scan the images. Only runs once `verify` passed.
+  docker:
+    name: docker (build · smoke test · image scan)
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same command a tester runs: builds the images, creates .env with an
+      # APP_KEY, starts every service and waits for /up.
+      - name: Build and start the stack
+        run: sh scripts/start.sh
+
+      - name: Smoke test
+        run: |
+          set -eu
+          base=http://localhost:8000
+          check() {
+            code="$(curl -s -o /dev/null -w '%{http_code}' "$base$2")"
+            if [ "$code" != "$1" ]; then
+              echo "::error title=Smoke test::$2 returned $code, expected $1"
+              exit 1
+            fi
+            echo "ok  $1 $2"
+          }
+          check 200 /up
+          check 200 /login
+          check 302 /generations
+          check 404 /index2.php
+          check 403 /.env
+          asset="$(curl -s "$base/login" | grep -oE '/build/assets/app-[^"]+\.js' | head -1)"
+          check 200 "$asset"
+          # Reverb through nginx's /app proxy: the WebSocket handshake.
+          key="$(grep '^REVERB_APP_KEY=' .env | cut -d= -f2)"
+          status="$(curl -s -i -N --max-time 3 \
+            -H 'Connection: Upgrade' -H 'Upgrade: websocket' \
+            -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+            "$base/app/$key?protocol=7" | head -1 | tr -d '\r' || true)"
+          case "$status" in
+            *" 101 "*) echo "ok  WebSocket: $status" ;;
+            *) echo "::error title=Smoke test::WebSocket handshake through /app failed: $status"; exit 1 ;;
+          esac
+          test "$(docker compose ps -a migrate --format '{{.State}}')" = exited
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+
+      # Fixable HIGH/CRITICAL vulnerabilities in the shipped images fail the
+      # build; unfixed ones can't be acted on yet, so they're left out.
+      - name: Image scan (Trivy)
+        run: |
+          for image in genstudio-app genstudio-web; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+              aquasec/trivy:0.76.2 image --quiet --scanners vuln \
+              --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$image"
+          done
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

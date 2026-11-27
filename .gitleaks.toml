@@ -1,0 +1,9 @@
+# gitleaks: the default rules, plus values that look like secrets but aren't.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The WebSocket handshake test key in CI's smoke test: the published sample nonce from RFC 6455 ('the sample nonce'), not a secret. Exact match only, so a real secret on the same line is still caught."
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']

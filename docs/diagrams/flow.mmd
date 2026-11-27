@@ -1,0 +1,40 @@
+%% How a generation moves through the app. Render: make diagrams
+%%{init: {"flowchart": {"wrappingWidth": 320, "nodeSpacing": 40, "rankSpacing": 60}, "themeVariables": {"fontSize": "15px"}}}%%
+flowchart LR
+    user(["User's browser"])
+
+    subgraph app ["GenStudio"]
+        direction LR
+        create["<b>CreateGeneration</b><br/>saves the request as <i>pending</i><br/>with its cost estimate"]
+        submit["<b>SubmitGeneration</b> job<br/>Idempotency-Key = our uuid<br/>waits and retries on 429 / 503"]
+        reject["<b>RejectGeneration</b><br/>gave up: shown as failed,<br/>never charged"]
+        hook["<b>Webhook endpoint</b><br/>checks the signature,<br/>stores each event once"]
+        process["<b>ProcessWebhookEvent</b> job"]
+        poll["<b>Scheduler</b> · every minute<br/>asks about generations<br/>with no news for 3 min"]
+        apply["<b>ApplyRemoteGeneration</b><br/>the only code that changes status or cost<br/>row lock · status only moves forward<br/>price set once, on success"]
+        image["<b>StoreGenerationImage</b><br/>keeps our own copy"]
+        reverb["<b>Reverb</b><br/>WebSocket"]
+    end
+
+    provider[("Image provider API")]
+
+    user -- "1 · prompt, size, quality" --> create
+    create --> submit
+    submit -- "2 · create" --> provider
+    provider -- "response" --> apply
+    submit -. "retries used up" .-> reject
+    provider -- "3 · webhooks: may repeat,<br/>arrive late or out of order" --> hook
+    hook --> process --> apply
+    poll -- "fallback: GET generation" --> provider
+    apply -- "on success" --> image
+    apply -- "4 · after commit" --> reverb
+    reverb -- "5 · live update" --> user
+
+    classDef core fill:#fff4d6,stroke:#c98a00,stroke-width:3px,color:#222
+    classDef job fill:#eef4ff,stroke:#4a6fb3,color:#222
+    classDef ext fill:#f1f1f1,stroke:#777,color:#222
+    classDef bad fill:#fdecec,stroke:#c0392b,color:#222
+    class apply core
+    class create,submit,hook,process,poll,image,reverb job
+    class provider,user ext
+    class reject bad

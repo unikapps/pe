@@ -1,0 +1,180 @@
+# =============================================================================
+# Full local stack: `make start` (or `composer start`), then http://localhost:8000
+#
+#   pgsql      Postgres 18 (also on localhost:5433, with a testing database)
+#   migrate    one-shot: runs the migrations, then exits
+#   php        PHP-FPM (the app)
+#   web        nginx: static files, PHP to `php`, /app to Reverb
+#   worker     queue worker (submissions, webhooks, image copies, broadcasts)
+#   scheduler  runs generations:sync-stale every minute
+#   reverb     WebSocket server for live updates
+#   test       `make test`: linters and the suite on the production PHP
+#
+# Host development (`php artisan dev`) only needs the database:
+#   docker compose up -d pgsql
+#
+# Values come from .env when set there (make start creates it), else the
+# defaults below. Put your provider key in .env as IMAGE_PROVIDER_API_KEY.
+# =============================================================================
+
+name: genstudio
+
+x-app: &app
+    build:
+        context: .
+        target: app
+    image: genstudio-app
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+        APP_NAME: 'GenStudio'
+        APP_ENV: local
+        APP_KEY: '${APP_KEY:?run make start, it creates .env with an APP_KEY}'
+        APP_DEBUG: 'true'
+        APP_URL: 'http://localhost:${APP_PORT:-8000}'
+        LOG_CHANNEL: stderr
+        DB_CONNECTION: pgsql
+        DB_HOST: pgsql
+        DB_PORT: '5432'
+        DB_DATABASE: '${DB_DATABASE:-genstudio}'
+        DB_USERNAME: '${DB_USERNAME:-app}'
+        DB_PASSWORD: '${DB_PASSWORD:-secret}'
+        SESSION_DRIVER: database
+        CACHE_STORE: database
+        QUEUE_CONNECTION: database
+        FILESYSTEM_DISK: local
+        MAIL_MAILER: log
+        BROADCAST_CONNECTION: reverb
+        REVERB_APP_ID: '${REVERB_APP_ID:-local}'
+        REVERB_APP_KEY: '${REVERB_APP_KEY:-local-key}'
+        REVERB_APP_SECRET: '${REVERB_APP_SECRET:-local-secret}'
+        # Where the app publishes events: Reverb on the internal network.
+        REVERB_HOST: reverb
+        REVERB_PORT: '8080'
+        REVERB_SCHEME: http
+        IMAGE_PROVIDER_BASE_URL: '${IMAGE_PROVIDER_BASE_URL:-}'
+        IMAGE_PROVIDER_SIGNATURE_HEADER: '${IMAGE_PROVIDER_SIGNATURE_HEADER:-}'
+        IMAGE_PROVIDER_API_KEY: '${IMAGE_PROVIDER_API_KEY:-}'
+        IMAGE_PROVIDER_WEBHOOK_SECRET: '${IMAGE_PROVIDER_WEBHOOK_SECRET:-}'
+    volumes:
+        - storage:/app/storage/app
+
+services:
+    pgsql:
+        image: postgres:18-alpine
+        restart: unless-stopped
+        ports:
+            - '${FORWARD_DB_PORT:-5433}:5432'
+        environment:
+            POSTGRES_DB: '${DB_DATABASE:-genstudio}'
+            POSTGRES_USER: '${DB_USERNAME:-app}'
+            POSTGRES_PASSWORD: '${DB_PASSWORD:-secret}'
+        volumes:
+            - pgsql:/var/lib/postgresql
+            - ./docker/pgsql/create-testing-database.sql:/docker-entrypoint-initdb.d/10-create-testing-database.sql
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -q -U ${DB_USERNAME:-app}']
+            interval: 5s
+            retries: 10
+
+    migrate:
+        <<: *app
+        restart: 'no'
+        command: ['php', 'artisan', 'migrate', '--force']
+        depends_on:
+            pgsql:
+                condition: service_healthy
+
+    php:
+        <<: *app
+        healthcheck:
+            test:
+                [
+                    'CMD',
+                    'php',
+                    '-r',
+                    "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);",
+                ]
+            interval: 10s
+            timeout: 3s
+            retries: 5
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    web:
+        build:
+            context: .
+            target: web
+        image: genstudio-web
+        restart: unless-stopped
+        mem_limit: 64m
+        ports:
+            - '${APP_PORT:-8000}:8080'
+        healthcheck:
+            test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/up']
+            interval: 10s
+            timeout: 3s
+            start_period: 10s
+            retries: 5
+        depends_on:
+            php:
+                condition: service_healthy
+            reverb:
+                condition: service_started
+
+    worker:
+        <<: *app
+        mem_limit: 384m
+        # Restarts itself after an hour or past 256 MB, so memory can't creep up.
+        command:
+            [
+                'php',
+                'artisan',
+                'queue:work',
+                '--sleep=1',
+                '--max-time=3600',
+                '--memory=256',
+            ]
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    scheduler:
+        <<: *app
+        mem_limit: 256m
+        command: ['php', 'artisan', 'schedule:work']
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    reverb:
+        <<: *app
+        mem_limit: 256m
+        command:
+            ['php', 'artisan', 'reverb:start', '--host=0.0.0.0', '--port=8080']
+
+    test:
+        build:
+            context: .
+            target: test
+        image: genstudio-test
+        profiles: ['test']
+        # Only connection details: everything else comes from phpunit.xml, whose
+        # <env> values don't override variables the container already has.
+        # Never inherit the app's environment here: DB_DATABASE would point the
+        # suite (and RefreshDatabase) at the app's own database.
+        environment:
+            APP_KEY: '${APP_KEY:?run make start, it creates .env with an APP_KEY}'
+            DB_HOST: pgsql
+            DB_PORT: '5432'
+            DB_DATABASE: genstudio_testing
+            DB_USERNAME: '${DB_USERNAME:-app}'
+            DB_PASSWORD: '${DB_PASSWORD:-secret}'
+        depends_on:
+            pgsql:
+                condition: service_healthy
+
+volumes:
+    pgsql:
+    storage:

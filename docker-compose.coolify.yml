@@ -1,0 +1,156 @@
+# =============================================================================
+# Coolify deployment: the whole stack from one compose file.
+#
+# In Coolify: New resource > Docker Compose, compose file docker-compose.coolify.yml.
+#
+# Domains are assigned ONLY in the Coolify UI (Domains page), never here: no
+# SERVICE_FQDN_* / SERVICE_URL_* magic vars. Give the `web` service its domain
+# WITH the internal port, or Coolify's proxy routes to port 80 and returns 502:
+#   web  ->  https://<domain>:8080
+# The public URL itself has no port. Set APP_URL to it (https://<domain>).
+# Nothing else needs a domain: the browser reaches Reverb through web's /app path.
+#
+# Coolify provides the proxy, TLS (Let's Encrypt) and the shared network.
+# `migrate` is a one-shot job; php, worker and scheduler wait for it.
+#
+# Image provider: create a dedicated API key for this deployment and set its webhook
+# URL to https://<domain>/webhooks/provider.
+# =============================================================================
+
+x-app: &app
+    build:
+        context: .
+        target: app
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+        APP_NAME: '${APP_NAME:-GenStudio}'
+        APP_ENV: production
+        # Generate once: echo "base64:$(openssl rand -base64 32)"
+        APP_KEY: '${APP_KEY:?set APP_KEY}'
+        APP_DEBUG: 'false'
+        APP_URL: '${APP_URL:?set APP_URL (https://<domain>)}'
+        LOG_CHANNEL: stderr
+        LOG_LEVEL: '${LOG_LEVEL:-info}'
+        DB_CONNECTION: pgsql
+        DB_HOST: pgsql
+        DB_PORT: '5432'
+        DB_DATABASE: '${DB_DATABASE:-genstudio}'
+        DB_USERNAME: '${DB_USERNAME:-app}'
+        DB_PASSWORD: '${DB_PASSWORD:?set DB_PASSWORD}'
+        SESSION_DRIVER: database
+        SESSION_SECURE_COOKIE: 'true'
+        CACHE_STORE: database
+        QUEUE_CONNECTION: database
+        FILESYSTEM_DISK: local
+        # No mail is needed: generating images doesn't require a verified email.
+        MAIL_MAILER: '${MAIL_MAILER:-log}'
+        BROADCAST_CONNECTION: reverb
+        REVERB_APP_ID: '${REVERB_APP_ID:?set REVERB_APP_ID}'
+        REVERB_APP_KEY: '${REVERB_APP_KEY:?set REVERB_APP_KEY}'
+        REVERB_APP_SECRET: '${REVERB_APP_SECRET:?set REVERB_APP_SECRET}'
+        # Where the app publishes events: Reverb on the internal network.
+        REVERB_HOST: reverb
+        REVERB_PORT: '8080'
+        REVERB_SCHEME: http
+        IMAGE_PROVIDER_BASE_URL: '${IMAGE_PROVIDER_BASE_URL:?set IMAGE_PROVIDER_BASE_URL}'
+        IMAGE_PROVIDER_SIGNATURE_HEADER: '${IMAGE_PROVIDER_SIGNATURE_HEADER:?set IMAGE_PROVIDER_SIGNATURE_HEADER}'
+        IMAGE_PROVIDER_API_KEY: '${IMAGE_PROVIDER_API_KEY:?set IMAGE_PROVIDER_API_KEY}'
+        IMAGE_PROVIDER_WEBHOOK_SECRET: '${IMAGE_PROVIDER_WEBHOOK_SECRET:?set IMAGE_PROVIDER_WEBHOOK_SECRET}'
+    volumes:
+        # Generated images (the provider's own URLs expire after 24 hours).
+        - storage:/app/storage/app
+
+services:
+    pgsql:
+        image: postgres:18-alpine
+        restart: unless-stopped
+        environment:
+            POSTGRES_DB: '${DB_DATABASE:-genstudio}'
+            POSTGRES_USER: '${DB_USERNAME:-app}'
+            POSTGRES_PASSWORD: '${DB_PASSWORD:?set DB_PASSWORD}'
+        volumes:
+            - pgsql:/var/lib/postgresql
+        healthcheck:
+            test: ['CMD-SHELL', 'pg_isready -q -U ${DB_USERNAME:-app}']
+            interval: 5s
+            timeout: 3s
+            retries: 10
+
+    migrate:
+        <<: *app
+        restart: 'no'
+        command: ['php', 'artisan', 'migrate', '--force']
+        depends_on:
+            pgsql:
+                condition: service_healthy
+
+    php:
+        <<: *app
+        healthcheck:
+            test:
+                [
+                    'CMD',
+                    'php',
+                    '-r',
+                    "exit(@fsockopen('127.0.0.1', 9000) ? 0 : 1);",
+                ]
+            interval: 10s
+            timeout: 3s
+            retries: 5
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    web:
+        build:
+            context: .
+            target: web
+        restart: unless-stopped
+        mem_limit: 64m
+        healthcheck:
+            test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/up']
+            interval: 10s
+            timeout: 3s
+            start_period: 10s
+            retries: 5
+        depends_on:
+            php:
+                condition: service_healthy
+            reverb:
+                condition: service_started
+
+    worker:
+        <<: *app
+        mem_limit: 384m
+        # Restarts itself after an hour or past 256 MB, so memory can't creep up.
+        command:
+            [
+                'php',
+                'artisan',
+                'queue:work',
+                '--sleep=1',
+                '--max-time=3600',
+                '--memory=256',
+            ]
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    scheduler:
+        <<: *app
+        mem_limit: 256m
+        command: ['php', 'artisan', 'schedule:work']
+        depends_on:
+            migrate:
+                condition: service_completed_successfully
+
+    reverb:
+        <<: *app
+        mem_limit: 256m
+        command:
+            ['php', 'artisan', 'reverb:start', '--host=0.0.0.0', '--port=8080']
+
+volumes:
+    pgsql:
+    storage:
