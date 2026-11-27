@@ -68,6 +68,8 @@ export default defineConfig({
         htmlWhitespaceSensitivity: 'css',
         ignorePatterns: [
             '.github/**',
+            // Written by the gitleaks action in CI.
+            'results.sarif',
             'composer.json',
             'resources/js/components/ui/*',
             'resources/views/mail/*',
